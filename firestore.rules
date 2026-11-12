@@ -1,0 +1,215 @@
+rules_version = '2';
+
+// Правила доступа к базе данных Firestore.
+//
+// Приложение обращается к базе напрямую, поэтому именно эти правила защищают данные:
+// сервер проверяет по ним каждое чтение и каждую запись. Без них любой человек
+// смог бы читать чужую переписку.
+//
+// Как включить: консоль Firebase → Firestore Database → вкладка «Правила» →
+// заменить текст содержимым этого файла → «Опубликовать» (README.md, шаг 6).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Пользователь вошёл в приложение
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Запись о дружбе и чат двух людей называются одинаково: "uidA_uidB".
+    // Проверяем, что текущий пользователь — один из этих двоих.
+    function isPairMember(pairId) {
+      return signedIn()
+        && pairId.split('_').size() == 2
+        && request.auth.uid in pairId.split('_');
+    }
+
+    // Эти двое — друзья (заявка принята)
+    function areFriends(pairId) {
+      return get(/databases/$(database)/documents/friendships/$(pairId)).data.status == 'accepted';
+    }
+
+    // Общий идентификатор пары: два uid по алфавиту через "_"
+    function pairOf(a, b) {
+      return a < b ? a + '_' + b : b + '_' + a;
+    }
+
+    function validProfile(d) {
+      return d.keys().hasOnly(['name', 'nickname', 'avatar', 'createdAt', 'updatedAt'])
+        && d.name is string && d.name.size() > 0 && d.name.size() <= 40
+        && d.nickname is string && d.nickname.matches('[a-z0-9_]{3,20}')
+        && (d.get('avatar', null) == null || (d.avatar is bytes && d.avatar.size() <= 100000));
+    }
+
+    // После записи ник должен числиться за этим пользователем
+    function ownsNickname(nickname) {
+      return getAfter(/databases/$(database)/documents/nicknames/$(nickname)).data.uid == request.auth.uid;
+    }
+
+    // ---------- Профили ----------
+    // Читать профиль можно, только зная uid (список всех пользователей получить нельзя).
+    match /users/{uid} {
+      allow get: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid
+        && validProfile(request.resource.data)
+        && ownsNickname(request.resource.data.nickname);
+      // При смене ника прежний должен быть освобождён той же записью
+      allow update: if signedIn() && request.auth.uid == uid
+        && validProfile(request.resource.data)
+        && ownsNickname(request.resource.data.nickname)
+        && (request.resource.data.nickname == resource.data.nickname
+            || !existsAfter(/databases/$(database)/documents/nicknames/$(resource.data.nickname)));
+    }
+
+    // ---------- Ники ----------
+    // Документ с именем ника хранит uid владельца. Создать можно только свободный ник
+    // и только вместе с профилем, в котором он указан, — так ники остаются уникальными.
+    match /nicknames/{nickname} {
+      allow get: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.nickname == nickname;
+      allow delete: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.nickname != nickname;
+    }
+
+    // ---------- Поиск по телефону ----------
+    // Записать можно только свой номер, подтверждённый кодом из SMS.
+    match /phones/{phone} {
+      allow get: if signedIn();
+      allow create, update: if signedIn()
+        && request.auth.token.phone_number == phone
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid;
+    }
+
+    // ---------- Поиск по аккаунту Google ----------
+    // Записать можно только свою подтверждённую почту.
+    match /emails/{email} {
+      allow get: if signedIn();
+      allow create, update: if signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower() == email
+        && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid;
+    }
+
+    // ---------- Друзья и заявки ----------
+    match /friendships/{pairId} {
+      allow get: if isPairMember(pairId);
+      allow list: if signedIn() && request.auth.uid in resource.data.members;
+
+      // Отправить заявку: статус только "pending", отправитель — я
+      allow create: if isPairMember(pairId)
+        && request.resource.data.keys().hasOnly(['members', 'requestedBy', 'status', 'createdAt', 'updatedAt'])
+        && request.resource.data.members is list
+        && request.resource.data.members.size() == 2
+        && request.resource.data.members[0] < request.resource.data.members[1]
+        && pairId == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+        && request.resource.data.requestedBy == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.members[0]))
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.members[1]));
+
+      // Принять заявку может только тот, кому она отправлена
+      allow update: if isPairMember(pairId)
+        && resource.data.status == 'pending'
+        && resource.data.requestedBy != request.auth.uid
+        && request.resource.data.status == 'accepted'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']);
+
+      // Отклонить, отозвать заявку или удалить из друзей может любой из двоих
+      allow delete: if isPairMember(pairId);
+    }
+
+    // ---------- Чаты ----------
+    match /chats/{chatId} {
+
+      function validChat(d) {
+        return d.keys().hasOnly(['members', 'lastText', 'lastSenderId', 'updatedAt', 'unread'])
+          && d.members is list
+          && d.members.size() == 2
+          && chatId == d.members[0] + '_' + d.members[1];
+      }
+
+      allow get: if isPairMember(chatId);
+      allow list: if signedIn() && request.auth.uid in resource.data.members;
+      allow create: if isPairMember(chatId)
+        && areFriends(chatId)
+        && validChat(request.resource.data);
+      allow update: if isPairMember(chatId)
+        && validChat(request.resource.data)
+        && request.resource.data.members == resource.data.members;
+
+      // Сообщения: читать могут оба участника, писать — только друзья и только от своего имени
+      match /messages/{messageId} {
+        allow read: if isPairMember(chatId);
+        allow create: if isPairMember(chatId)
+          && areFriends(chatId)
+          && request.resource.data.keys().hasOnly(
+               ['senderId', 'type', 'text', 'mediaId', 'durationMs', 'width', 'height', 'createdAt', 'status'])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.type in ['text', 'image', 'voice']
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 4000
+          && request.resource.data.status == 'sent'
+          && request.resource.data.createdAt == request.time;
+
+        // Получатель меняет только статус и только «вперёд»:
+        // отправлено → доставлено → прочитано
+        allow update: if isPairMember(chatId)
+          && resource.data.senderId != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && ((resource.data.status == 'sent' && request.resource.data.status in ['delivered', 'read'])
+              || (resource.data.status == 'delivered' && request.resource.data.status == 'read'));
+      }
+
+      // Фото и голосовые сообщения
+      match /media/{mediaId} {
+        allow get: if isPairMember(chatId);
+        allow create: if isPairMember(chatId)
+          && areFriends(chatId)
+          && request.resource.data.keys().hasOnly(['ownerId', 'kind', 'bytes', 'createdAt'])
+          && request.resource.data.ownerId == request.auth.uid
+          && request.resource.data.kind in ['image', 'voice']
+          && request.resource.data.bytes is bytes;
+      }
+    }
+
+    // ---------- Звонки ----------
+    match /calls/{callId} {
+
+      function isCallParty(call) {
+        return call.callerId == request.auth.uid || call.calleeId == request.auth.uid;
+      }
+
+      allow read: if signedIn() && isCallParty(resource.data);
+
+      // Позвонить можно только другу
+      allow create: if signedIn()
+        && request.resource.data.callerId == request.auth.uid
+        && request.resource.data.calleeId is string
+        && request.resource.data.calleeId != request.auth.uid
+        && request.resource.data.status == 'ringing'
+        && areFriends(pairOf(request.resource.data.callerId, request.resource.data.calleeId));
+
+      // Менять состояние звонка могут оба участника, но не подменять самих участников
+      allow update: if signedIn()
+        && isCallParty(resource.data)
+        && request.resource.data.callerId == resource.data.callerId
+        && request.resource.data.calleeId == resource.data.calleeId;
+
+      // Сетевые адреса для соединения телефонов
+      match /candidates/{candidateId} {
+        allow read: if signedIn()
+          && isCallParty(get(/databases/$(database)/documents/calls/$(callId)).data);
+        allow create: if signedIn()
+          && request.resource.data.from == request.auth.uid
+          && isCallParty(get(/databases/$(database)/documents/calls/$(callId)).data);
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Цвет выделения в панели эмодзи для тёмной темы -->
+    <color name="brand">#86D6C2</color>
+</resources>

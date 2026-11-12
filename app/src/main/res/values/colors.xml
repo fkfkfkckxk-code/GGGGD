@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Цвет фона значка приложения -->
+    <color name="ic_launcher_background">#2E7D6B</color>
+    <!-- Цвет выделения в панели эмодзи -->
+    <color name="brand">#1F6F5F</color>
+</resources>

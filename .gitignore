@@ -1,0 +1,20 @@
+# Служебные файлы Gradle и Android Studio
+*.iml
+.gradle/
+.kotlin/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# Настройки ВАШЕГО проекта Firebase. Файл у каждого свой — его скачивают
+# в консоли Firebase и кладут в папку app/ (см. README.md, шаг 3).
+/app/google-services.json
+
+# Ключи подписи приложения — никогда не выкладывайте их в интернет
+*.jks
+*.keystore
